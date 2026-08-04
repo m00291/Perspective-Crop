@@ -1,0 +1,545 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=contain">
+  <link rel="manifest" href="manifest.json">
+  <link rel="icon" type="image/svg+xml" href="crop.svg">
+  <link rel="stylesheet" href="style.css">
+  <title>Perspective Crop</title>
+</head>
+<body>
+
+  <button id="btn-close" class="circ-btn">✕</button>
+  <button id="btn-mag-toggle" class="circ-btn">🔍</button>
+  <button id="btn-theme" class="circ-btn">🌙</button>
+
+  <div id="zoom-container">
+    <input type="range" id="zoom-slider" min="0.5" max="2.0" step="0.1" value="1.2">
+    <span id="zoom-text">1.2X</span>
+  </div>
+
+  <button id="btn-reset" class="circ-btn disabled">↺</button>
+  <button id="btn-apply" class="circ-btn disabled">✓</button>
+  
+  <button id="btn-back" class="circ-btn">
+    <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" class="svg-icon">
+      <line x1="19" y1="12" x2="5" y2="12"></line>
+      <polyline points="12 19 5 12 12 5"></polyline>
+    </svg>
+  </button>
+  <button id="btn-download" class="circ-btn">
+    <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" class="svg-icon">
+      <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"></path>
+      <polyline points="7 10 12 15 17 10"></polyline>
+      <line x1="12" y1="15" x2="12" y2="3"></line>
+    </svg>
+  </button>
+
+  <div id="work-area">
+    <div id="upload-placeholder">
+      <div style="font-size: 36px; margin-bottom: 8px;">📷</div>
+      <div>Choose a photo<br>or drag and drop</div>
+      <div style="position: absolute; bottom: 8px; right: 12px; font-size: 11px; opacity: 0.5;">v.2.3.41</div>
+    </div>
+    <canvas id="img-layer"></canvas>
+    <canvas id="ui-layer"></canvas>
+    <div id="loading-overlay" style="display: none;"><div class="spinner"></div></div>
+  </div>
+
+  <div id="magnifier">
+    <canvas id="mag-canvas"></canvas>
+    <div id="mag-crosshair"></div>
+  </div>
+
+  <input type="file" id="file-input" accept="image/*">
+
+<script>
+  if ('serviceWorker' in navigator) {
+    navigator.serviceWorker.register('sw.js').catch(() => {});
+  }
+
+  // Elements
+  const btnClose = document.getElementById('btn-close');
+  const btnTheme = document.getElementById('btn-theme');
+  const btnMagToggle = document.getElementById('btn-mag-toggle');
+  const zoomContainer = document.getElementById('zoom-container');
+  const zoomSlider = document.getElementById('zoom-slider');
+  const zoomText = document.getElementById('zoom-text');
+  const btnReset = document.getElementById('btn-reset');
+  const btnApply = document.getElementById('btn-apply');
+  const btnBack = document.getElementById('btn-back');
+  const btnDownload = document.getElementById('btn-download');
+  
+  const workArea = document.getElementById('work-area');
+  const uploadPlaceholder = document.getElementById('upload-placeholder');
+  const loadingOverlay = document.getElementById('loading-overlay');
+  const imgCanvas = document.getElementById('img-layer');
+  const uiCanvas = document.getElementById('ui-layer');
+  const imgCtx = imgCanvas.getContext('2d');
+  const uiCtx = uiCanvas.getContext('2d');
+  
+  const magnifier = document.getElementById('magnifier');
+  const magCanvas = document.getElementById('mag-canvas');
+  const magCtx = magCanvas.getContext('2d');
+  const fileInput = document.getElementById('file-input');
+
+  // Setup High-DPI Magnifier Canvas
+  const dpr = window.devicePixelRatio || 1;
+  magCanvas.style.width = '140px';
+  magCanvas.style.height = '140px';
+  magCanvas.width = 140 * dpr;
+  magCanvas.height = 140 * dpr;
+  magCtx.setTransform(dpr, 0, 0, dpr, 0, 0); // Scale internal math to match CSS
+
+  // State
+  let isDark = false;
+  let mode = 'upload'; // upload, crop, result, processing
+  let image = new Image();
+  let imgFileName = "image";
+  let cropResultImage = new Image();
+  
+  let w = 0, h = 0;
+  let imgDraw = { x: 0, y: 0, w: 0, h: 0 };
+  let points = [];
+  let origPoints = [];
+  let activePointId = -1;
+  let magZoom = 1.2;
+
+  // Resize handling with High-DPI Display Scaling
+  function resize() {
+    w = workArea.clientWidth;
+    h = workArea.clientHeight;
+    const dpr = window.devicePixelRatio || 1;
+    
+    // Scale Image Layer
+    imgCanvas.style.width = w + 'px';
+    imgCanvas.style.height = h + 'px';
+    imgCanvas.width = w * dpr;
+    imgCanvas.height = h * dpr;
+    imgCtx.setTransform(dpr, 0, 0, dpr, 0, 0);
+
+    // Scale UI Layer
+    uiCanvas.style.width = w + 'px';
+    uiCanvas.style.height = h + 'px';
+    uiCanvas.width = w * dpr;
+    uiCanvas.height = h * dpr;
+    uiCtx.setTransform(dpr, 0, 0, dpr, 0, 0);
+
+    if(mode === 'crop') {
+      imgCtx.clearRect(0,0,w,h);
+      if(image.src) imgCtx.drawImage(image, imgDraw.x, imgDraw.y, imgDraw.w, imgDraw.h);
+      renderCrop();
+    }
+    if(mode === 'result') {
+      renderResult();
+    }
+  }
+  window.addEventListener('resize', resize);
+  resize();
+
+  // Theme Toggle
+  btnTheme.onclick = () => {
+    isDark = !isDark;
+    document.body.setAttribute('data-theme', isDark ? 'dark' : 'light');
+    btnTheme.innerHTML = isDark ? '☀️' : '🌙';
+  };
+
+  // Magnifier Toggle & Slider
+  btnMagToggle.onclick = () => {
+    zoomContainer.style.display = zoomContainer.style.display === 'flex' ? 'none' : 'flex';
+  };
+  zoomSlider.oninput = (e) => { 
+    magZoom = parseFloat(e.target.value); 
+    zoomText.innerText = magZoom.toFixed(1) + 'X';
+  };
+
+  // Upload & Drop
+  workArea.onclick = (e) => { if (mode === 'upload') fileInput.click(); };
+  workArea.ondragover = (e) => { e.preventDefault(); };
+  workArea.ondrop = (e) => {
+    e.preventDefault();
+    if (mode === 'upload' && e.dataTransfer.files[0]) handleFile(e.dataTransfer.files[0]);
+  };
+  fileInput.onchange = (e) => {
+    if (e.target.files[0]) handleFile(e.target.files[0]);
+    fileInput.value = '';
+  };
+
+  function handleFile(file) {
+    imgFileName = file.name.split('.')[0] || "image";
+    const url = URL.createObjectURL(file);
+    image.onload = () => { initCrop(); URL.revokeObjectURL(url); };
+    image.src = url;
+  }
+
+  // Reset All
+  btnClose.onclick = () => {
+    mode = 'upload';
+    imgCtx.clearRect(0,0,w,h);
+    uiCtx.clearRect(0,0,w,h);
+    uploadPlaceholder.style.display = 'flex';
+    btnReset.classList.add('disabled');
+    btnApply.classList.add('disabled');
+    btnApply.innerHTML = '✓';
+    btnApply.style.display = 'flex';
+    btnReset.style.display = 'flex';
+    btnBack.style.display = 'none';
+    btnDownload.style.display = 'none';
+    loadingOverlay.style.display = 'none';
+  };
+
+  function initCrop() {
+    mode = 'crop';
+    uploadPlaceholder.style.display = 'none';
+    
+    // Fit image leaving padding for fat fingers
+    const padding = 50;
+    const scale = Math.min((w - padding*2) / image.naturalWidth, (h - padding*2) / image.naturalHeight);
+    imgDraw.w = image.naturalWidth * scale;
+    imgDraw.h = image.naturalHeight * scale;
+    imgDraw.x = (w - imgDraw.w) / 2;
+    imgDraw.y = (h - imgDraw.h) / 2;
+
+    imgCtx.clearRect(0,0,w,h);
+    imgCtx.drawImage(image, imgDraw.x, imgDraw.y, imgDraw.w, imgDraw.h);
+
+    // Ordered exactly: Top-Left, Top-Right, Bottom-Right, Bottom-Left
+    points = [
+      { id: 0, x: imgDraw.x, y: imgDraw.y },
+      { id: 1, x: imgDraw.x + imgDraw.w, y: imgDraw.y },
+      { id: 2, x: imgDraw.x + imgDraw.w, y: imgDraw.y + imgDraw.h },
+      { id: 3, x: imgDraw.x, y: imgDraw.y + imgDraw.h }
+    ];
+    saveOrigPoints();
+    updateButtons();
+    renderCrop();
+  }
+
+  function saveOrigPoints() {
+    origPoints = points.map(p => ({...p}));
+  }
+
+  function renderCrop() {
+    uiCtx.clearRect(0,0,w,h);
+    if (mode !== 'crop') return;
+    
+    // Draw polygon outline sequentially using explicit user order
+    uiCtx.beginPath();
+    uiCtx.moveTo(points[0].x, points[0].y);
+    for(let i=1; i<4; i++) uiCtx.lineTo(points[i].x, points[i].y);
+    uiCtx.closePath();
+    uiCtx.lineWidth = 2;
+    uiCtx.strokeStyle = 'rgba(0, 102, 204, 0.5)';
+    uiCtx.stroke();
+    uiCtx.fillStyle = 'rgba(255, 255, 255, 0.1)';
+    uiCtx.fill();
+
+    // Draw tiny white dots with stroke
+    points.forEach(p => {
+      uiCtx.beginPath();
+      uiCtx.arc(p.x, p.y, 3, 0, Math.PI * 2);
+      uiCtx.fillStyle = '#ffffff';
+      uiCtx.fill();
+      uiCtx.strokeStyle = 'rgba(0, 0, 0, 0.3)';
+      uiCtx.lineWidth = 1;
+      uiCtx.stroke();
+    });
+  }
+
+  function updateButtons() {
+    let modified = false;
+    for(let i=0; i<4; i++) {
+      if (Math.hypot(points[i].x - origPoints[i].x, points[i].y - origPoints[i].y) > 1.0) {
+        modified = true;
+        break;
+      }
+    }
+
+    if (modified) {
+      btnReset.classList.remove('disabled');
+      btnApply.classList.remove('disabled');
+    } else {
+      btnReset.classList.add('disabled');
+      btnApply.classList.add('disabled');
+    }
+  }
+
+  btnReset.onclick = () => {
+    if(mode !== 'crop') return;
+    points = origPoints.map(p => ({...p}));
+    updateButtons();
+    renderCrop();
+  };
+
+  // Touch / Pointer logic relative to workArea bounds
+  workArea.addEventListener('pointerdown', (e) => {
+    if (mode !== 'crop') return;
+    const rect = workArea.getBoundingClientRect();
+    const mx = e.clientX - rect.left;
+    const my = e.clientY - rect.top;
+
+    let bestDist = 40; 
+    activePointId = -1;
+    points.forEach(p => {
+      let dist = Math.hypot(mx - p.x, my - p.y);
+      if (dist < bestDist) { bestDist = dist; activePointId = p.id; }
+    });
+
+    if (activePointId !== -1) {
+      magnifier.style.display = 'block';
+      updateMagnifier(e.clientX, mx, my); // pass screen X for magnifier placement
+    }
+  });
+
+  workArea.addEventListener('pointermove', (e) => {
+    if (mode !== 'crop' || activePointId === -1) return;
+    const rect = workArea.getBoundingClientRect();
+    const mx = e.clientX - rect.left;
+    const my = e.clientY - rect.top;
+
+    const pt = points.find(p => p.id === activePointId);
+    pt.x = mx;
+    pt.y = my;
+    
+    renderCrop();
+    updateMagnifier(e.clientX, mx, my);
+  });
+
+  workArea.addEventListener('pointerup', (e) => {
+    if (activePointId !== -1) {
+      activePointId = -1;
+      magnifier.style.display = 'none';
+      updateButtons();
+    }
+  });
+  workArea.addEventListener('pointercancel', () => { activePointId = -1; magnifier.style.display = 'none'; });
+
+  function updateMagnifier(screenX, mx, my) {
+    if (screenX < window.innerWidth / 2) {
+      magnifier.style.left = (window.innerWidth - 160) + 'px';
+    } else {
+      magnifier.style.left = '20px';
+    }
+    
+    const srcX = (mx - imgDraw.x) / imgDraw.w * image.naturalWidth;
+    const srcY = (my - imgDraw.y) / imgDraw.h * image.naturalHeight;
+
+    magCtx.save();
+    
+    magCtx.clearRect(0, 0, 140, 140);
+    magCtx.fillStyle = isDark ? '#000000' : '#ffffff';
+    magCtx.fillRect(0, 0, 140, 140);
+    
+    magCtx.translate(70, 70);
+    magCtx.scale(magZoom, magZoom);
+    magCtx.drawImage(image, -srcX, -srcY);
+    
+    magCtx.restore();
+  }
+
+  // Web Worker for Async Bicubic Perspective Transform
+  const workerScript = `
+  self.onmessage = function(e) {
+    const { idata, w, h, p0, p1, p2, p3, outW, outH, isDark } = e.data;
+    const outData = new Uint8ClampedArray(outW * outH * 4);
+    
+    const bg = isDark ? 0 : 255; // 0 for dark theme, 255 for light theme
+
+    const sx = p0.x - p1.x + p2.x - p3.x;
+    const sy = p0.y - p1.y + p2.y - p3.y;
+
+    let a11, a12, a13, a14, a21, a22, a23, a24;
+    
+    // Affine fallback check (parallelogram)
+    if (Math.abs(sx) < 0.0001 && Math.abs(sy) < 0.0001) {
+      a11 = p1.x - p0.x; a21 = p1.y - p0.y;
+      a12 = p3.x - p0.x; a22 = p3.y - p0.y;
+      a13 = 0; a23 = 0;
+      a14 = p0.x; a24 = p0.y;
+    } else {
+      // Projective Transformation (Homography mapping)
+      const dx1 = p1.x - p2.x; const dx2 = p3.x - p2.x;
+      const dy1 = p1.y - p2.y; const dy2 = p3.y - p2.y;
+      const det = dx1 * dy2 - dx2 * dy1;
+      
+      if (det !== 0) {
+        a13 = (sx * dy2 - sy * dx2) / det;
+        a23 = (dx1 * sy - dy1 * sx) / det;
+      } else {
+        a13 = 0; a23 = 0; // Collinear fallback
+      }
+      
+      a11 = p1.x - p0.x + a13 * p1.x;
+      a21 = p1.y - p0.y + a13 * p1.y;
+      a12 = p3.x - p0.x + a23 * p3.x;
+      a22 = p3.y - p0.y + a23 * p3.y;
+      a14 = p0.x; a24 = p0.y;
+    }
+
+    function cubic(x) {
+      const a = -0.5;
+      let absX = Math.abs(x);
+      if (absX <= 1) return (a + 2)*absX*absX*absX - (a + 3)*absX*absX + 1;
+      if (absX < 2) return a*absX*absX*absX - 5*a*absX*absX + 8*a*absX - 4*a;
+      return 0;
+    }
+
+    for (let y = 0; y < outH; y++) {
+      for (let x = 0; x < outW; x++) {
+        const u_norm = x / outW;
+        const v_norm = y / outH;
+        const den = a13 * u_norm + a23 * v_norm + 1;
+        const srcX = (a11 * u_norm + a12 * v_norm + a14) / den;
+        const srcY = (a21 * u_norm + a22 * v_norm + a24) / den;
+
+        const ix = Math.floor(srcX); const iy = Math.floor(srcY);
+        const fx = srcX - ix; const fy = srcY - iy;
+
+        let r = 0, g = 0, b = 0;
+
+        for (let m = -1; m <= 2; m++) {
+          const ixm = ix + m;
+          const wx = cubic(m - fx);
+          
+          for (let n = -1; n <= 2; n++) {
+            const iyn = iy + n;
+            const weight = wx * cubic(n - fy);
+            
+            // If coordinate falls outside, contribute the theme background color 
+            // proportional to the cubic weight, effectively anti-aliasing the edge.
+            if (ixm < 0 || ixm >= w || iyn < 0 || iyn >= h) {
+              r += bg * weight;
+              g += bg * weight;
+              b += bg * weight;
+            } else {
+              const idx = (iyn * w + ixm) * 4;
+              r += idata[idx] * weight;
+              g += idata[idx+1] * weight;
+              b += idata[idx+2] * weight;
+            }
+          }
+        }
+
+        const outIdx = (y * outW + x) * 4;
+        outData[outIdx] = Math.min(Math.max(r, 0), 255);
+        outData[outIdx+1] = Math.min(Math.max(g, 0), 255);
+        outData[outIdx+2] = Math.min(Math.max(b, 0), 255);
+        outData[outIdx+3] = 255;
+      }
+    }
+    self.postMessage({ outData }, [outData.buffer]);
+  };
+  `;
+
+  const blob = new Blob([workerScript], { type: 'application/javascript' });
+  const workerURL = URL.createObjectURL(blob);
+
+  btnApply.onclick = () => {
+    if(mode !== 'crop') return;
+    mode = 'processing';
+    uiCtx.clearRect(0,0,w,h);
+    
+    btnApply.innerHTML = '⏳';
+    btnApply.classList.add('processing');
+    btnReset.classList.add('disabled');
+    loadingOverlay.style.display = 'flex';
+
+    const offCanvas = document.createElement('canvas');
+    offCanvas.width = image.naturalWidth;
+    offCanvas.height = image.naturalHeight;
+    const offCtx = offCanvas.getContext('2d', { willReadFrequently: true });
+    offCtx.drawImage(image, 0, 0);
+    const imgData = offCtx.getImageData(0, 0, image.naturalWidth, image.naturalHeight);
+
+    const imgPts = points.map(p => {
+      return {
+        x: (p.x - imgDraw.x) / imgDraw.w * image.naturalWidth,
+        y: (p.y - imgDraw.y) / imgDraw.h * image.naturalHeight
+      };
+    });
+
+    // Use dimensions from the explicit point order (0: TL, 1: TR, 2: BR, 3: BL)
+    const w1 = Math.hypot(imgPts[1].x - imgPts[0].x, imgPts[1].y - imgPts[0].y);
+    const w2 = Math.hypot(imgPts[2].x - imgPts[3].x, imgPts[2].y - imgPts[3].y);
+    const h1 = Math.hypot(imgPts[3].x - imgPts[0].x, imgPts[3].y - imgPts[0].y);
+    const h2 = Math.hypot(imgPts[2].x - imgPts[1].x, imgPts[2].y - imgPts[1].y);
+    const outW = Math.max(Math.round(w1), Math.round(w2));
+    const outH = Math.max(Math.round(h1), Math.round(h2));
+
+    const worker = new Worker(workerURL);
+    worker.postMessage({
+      idata: imgData.data, w: image.naturalWidth, h: image.naturalHeight,
+      p0: imgPts[0], p1: imgPts[1], p2: imgPts[2], p3: imgPts[3],
+      outW, outH, isDark
+    });
+
+    worker.onmessage = (e) => {
+      const outData = e.data.outData;
+      const newImgData = new ImageData(outData, outW, outH);
+      const resCanvas = document.createElement('canvas');
+      resCanvas.width = outW; resCanvas.height = outH;
+      resCanvas.getContext('2d').putImageData(newImgData, 0, 0);
+      
+      // FIX: Use Blob instead of DataURL to prevent iOS Safari memory crashes
+      resCanvas.toBlob((blob) => {
+        // Clean up previous blob URL if it exists to prevent memory leaks
+        if (cropResultImage.src && cropResultImage.src.startsWith('blob:')) {
+          URL.revokeObjectURL(cropResultImage.src);
+        }
+        
+        cropResultImage.onload = () => {
+          mode = 'result';
+          loadingOverlay.style.display = 'none';
+          renderResult();
+          
+          btnApply.classList.remove('processing');
+          btnApply.style.display = 'none';
+          btnReset.style.display = 'none';
+          btnBack.style.display = 'flex';
+          btnDownload.style.display = 'flex';
+          worker.terminate();
+        };
+        
+        cropResultImage.src = URL.createObjectURL(blob);
+      }, 'image/jpeg', 0.82);
+    };
+  };
+
+  function renderResult() {
+    if(mode !== 'result') return;
+    imgCtx.clearRect(0,0,w,h);
+    const scale = Math.min((w - 20) / cropResultImage.width, (h - 20) / cropResultImage.height);
+    const drawW = cropResultImage.width * scale;
+    const drawH = cropResultImage.height * scale;
+    imgCtx.drawImage(cropResultImage, (w - drawW)/2, (h - drawH)/2, drawW, drawH);
+  }
+
+  // Go Back
+  btnBack.onclick = () => {
+    mode = 'crop';
+    btnApply.innerHTML = '✓';
+    btnApply.style.display = 'flex';
+    btnReset.style.display = 'flex';
+    btnBack.style.display = 'none';
+    btnDownload.style.display = 'none';
+    
+    imgCtx.clearRect(0,0,w,h);
+    imgCtx.drawImage(image, imgDraw.x, imgDraw.y, imgDraw.w, imgDraw.h);
+    updateButtons();
+    renderCrop();
+  };
+
+  // Download JPG
+  btnDownload.onclick = () => {
+    const link = document.createElement('a');
+    link.download = `${imgFileName}-crop.jpg`;
+    link.href = cropResultImage.src;
+
+    document.body.appendChild(link);
+    link.click();
+    document.body.removeChild(link);
+  };
+</script>
+</body>
+</html>
