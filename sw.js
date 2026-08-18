@@ -1,5 +1,5 @@
 const APP_PREFIX = 'perspective-crop-';
-const CACHE_NAME = `${APP_PREFIX}v2.3.41`;
+const CACHE_NAME = `${APP_PREFIX}v2.3.51`;
 const ASSETS = [
   './index.html',
   './crop.svg',
